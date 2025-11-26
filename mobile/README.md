@@ -1,36 +1,33 @@
-React Native Mobile — Voucher (Option 3) Example
+React Native Mobile — iOS Challenge-Response Pairing (Option B)
+
+Goal
+- iOS-only app that enables two users to pair via a live challenge-response exchange using iOS MultipeerConnectivity.
+- Owner signs a random challenge from the scanner using Ed25519 private key (stored in Keychain).
+- Scanner verifies the signature server-side and creates a pairing.
+- Design ensures screenshots or static token sharing is useless; interaction must be live and in-person.
+
+Flow
+1. Both users generate Ed25519 keypairs on-device (private key in Secure Enclave/Keychain).
+2. Owner registers public key with backend via `POST /pairing/register-key`.
+3. Scanner and owner connect via MultipeerConnectivity (in-person Bluetooth discovery).
+4. Scanner generates a random challenge and sends it to the owner.
+5. Owner signs the challenge with their private key and sends the signature back.
+6. Scanner POSTs { owner_id, challenge, sig } to backend `/pairing/challenge`.
+7. Backend verifies signature using owner's stored public key and creates a pairing.
 
 Dependencies (install in `mobile/` project root):
-- react-native-keychain
-- react-native-nfc-manager
-- tweetnacl
-- js-base64 (optional) or tweetnacl-util for encoding helpers
-
-Install (example):
-
-```powershell
-cd canImakeanApp\mobile
-npm install react-native-keychain react-native-nfc-manager tweetnacl js-base64
-# then follow each native module's linking/installation steps (autolinking usually handles it)
+```
+npm install react-native-keychain tweetnacl js-base64 uuid react-native-crypto
 ```
 
+Note: `react-native-multipeer` or a native Multipeer module is required for device-to-device communication. For now, the prototype includes a local simulation mode for testing the crypto flow.
+
+Backend API changes
+- `POST /pairing/register-key` — stores owner's public key server-side
+- `POST /pairing/challenge` — accepts challenge and signature, verifies, creates pairing
+- users table now has `public_key` column
+
 Files provided
-- `voucher.js` — utility to generate keypair, store private key, export public key, sign voucher.
-- `App.js` — minimal example using `voucher.js` to generate keys, create a voucher, sign, and write to NFC.
+- `App.js` — main UI with modes (Owner, Scanner) and test/simulation buttons
+- `multipeer.js` — placeholder for future Multipeer connectivity helpers
 
-Notes
-- This is a minimal example for prototyping. For production, use hardware-backed key storage and careful error handling.
-- On iOS, to use Secure Enclave with `react-native-keychain`, set appropriate options. On Android, ensure `react-native-keychain` supports hardware-backed keystore on the device.
-
-Scanner & Claim
-- The `Scan Tag & Claim` button in `App.js` will read the voucher JSON payload from a tag and POST it to your backend's `/pairing/claim-voucher` endpoint.
-- Provide the backend URL and a scanner access token (JWT) in the UI before scanning.
-
-Sample voucher payload fields read from tag:
-- `owner_id`, `voucher_id`, `expires_at`, `pubkey` (base64), `sig` (base64)
-
-Server endpoint expected: `POST /pairing/claim-voucher` with JSON body containing the above fields and `Authorization: Bearer <scanner-jwt>` header.
-
-Testing tips
-- Use two devices: one to write a voucher, the other to scan and claim.
-- Ensure the backend is reachable from the scanner device and that the scanner's JWT has been generated via `/auth/login`.

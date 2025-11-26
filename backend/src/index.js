@@ -238,6 +238,59 @@ app.delete('/pairings/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Register public key for current user (iOS device identifies itself)
+app.post('/pairing/register-key', authMiddleware, async (req, res) => {
+  try {
+    const { public_key } = req.body;
+    if (!public_key) return res.status(400).json({ error: 'public_key required' });
+    await db.query('UPDATE users SET public_key=$1 WHERE id=$2', [public_key, req.user.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// Claim pairing via live challenge (iOS Multipeer)
+// Expected body: { owner_id, challenge, sig }
+// Scanner POSTs with their auth token; server verifies challenge signature using owner's stored public key
+app.post('/pairing/challenge', authMiddleware, async (req, res) => {
+  try {
+    const { owner_id, challenge, sig } = req.body;
+    if (!owner_id || !challenge || !sig) return res.status(400).json({ error: 'owner_id, challenge, sig required' });
+
+    // Get owner's stored public key
+    const ownerRow = await db.query('SELECT public_key FROM users WHERE id=$1', [owner_id]);
+    if (!ownerRow.rows[0] || !ownerRow.rows[0].public_key) return res.status(400).json({ error: 'owner public key not found' });
+
+    const pubkey = ownerRow.rows[0].public_key;
+
+    // Verify signature: challenge is base64-encoded bytes, sig is base64-encoded signature
+    // message to verify is the raw challenge bytes
+    const challengeBuf = Buffer.from(challenge, 'base64');
+    const sigBuf = Buffer.from(sig, 'base64');
+    const pubBuf = Buffer.from(pubkey, 'base64');
+    const ok = nacl.sign.detached.verify(new Uint8Array(challengeBuf), new Uint8Array(sigBuf), new Uint8Array(pubBuf));
+    if (!ok) return res.status(400).json({ error: 'invalid signature' });
+
+    // Create pairing
+    const userA = owner_id;
+    const userB = req.user.id;
+    const [low, high] = [userA, userB].sort();
+
+    const insert = await db.query(
+      `INSERT INTO pairings(user_a, user_b, code_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING id,user_a,user_b,created_at`,
+      [low, high, null]
+    );
+
+    const pairing = insert.rows[0] || { message: 'pairing already exists' };
+    res.json({ pairing });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });

@@ -1,12 +1,13 @@
-// App.js — iOS Multipeer + challenge-response pairing prototype
-// This version focuses on the challenge-response flow for iOS devices
+// App_multipeer.js — iOS Challenge-Response with Multipeer Integration (sketch)
+// This is a reference implementation showing how to integrate the native bridge
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { Button, SafeAreaView, Text, View, TextInput, Alert, ScrollView, ActivityIndicator } from 'react-native';
 import * as Keychain from 'react-native-keychain';
 import nacl from 'tweetnacl';
 import { Base64 } from 'js-base64';
 import crypto from 'react-native-crypto';
+import * as MultipeerBridge from './multipeerBridge';
 
 // ============ KEYPAIR MANAGEMENT ============
 const KEY_SERVICE = 'canimakeanapp_privkey';
@@ -69,22 +70,30 @@ async function postChallengeToServer(backendUrl, accessToken, ownerId, challenge
   return res.json();
 }
 
-// ============ CHALLENGE GENERATION ============
-async function generateChallenge() {
-  const randomBytes = crypto.getRandomValues(new Uint8Array(32));
-  const challenge = Base64.fromUint8Array(randomBytes);
-  return challenge;
-}
-
 // ============ APP COMPONENT ============
 export default function App() {
   const [userId, setUserId] = useState('');
+  const [ownerId, setOwnerId] = useState('');
   const [pubkey, setPubkey] = useState(null);
   const [backendUrl, setBackendUrl] = useState('');
   const [accessToken, setAccessToken] = useState('');
   const [mode, setMode] = useState(null);
   const [loading, setLoading] = useState(false);
   const [pairingResult, setPairingResult] = useState(null);
+  const [statusMessage, setStatusMessage] = useState('');
+  
+  const dataReceivedListenerRef = useRef(null);
+  const peerConnectedListenerRef = useRef(null);
+  const currentChallengeRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      // Cleanup listeners on unmount
+      if (dataReceivedListenerRef.current) dataReceivedListenerRef.current.remove();
+      if (peerConnectedListenerRef.current) peerConnectedListenerRef.current.remove();
+      MultipeerBridge.stopSession();
+    };
+  }, []);
 
   async function handleInitKeys() {
     if (!userId) return Alert.alert('User ID required');
@@ -116,28 +125,91 @@ export default function App() {
 
   async function handleOwnerMode() {
     if (!pubkey) return Alert.alert('Generate keys first');
+    setLoading(true);
     setMode('owner');
-    Alert.alert('Owner mode', 'Waiting for scanner to connect via Multipeer (TODO)');
+    setStatusMessage('Advertising for scanner discovery...');
+    
+    try {
+      // Start advertising
+      await MultipeerBridge.startAdvertising(`Owner-${userId.substring(0, 8)}`);
+      setStatusMessage('Advertised. Waiting for scanner to connect...');
+
+      // Listen for incoming challenge
+      if (dataReceivedListenerRef.current) dataReceivedListenerRef.current.remove();
+      dataReceivedListenerRef.current = MultipeerBridge.onDataReceived(async (event) => {
+        try {
+          const challenge = event.data;
+          setStatusMessage(`Received challenge, signing...`);
+          const sig = await signChallenge(challenge);
+          await MultipeerBridge.sendSignature(sig);
+          setStatusMessage('Signature sent to scanner');
+        } catch (e) {
+          Alert.alert('Error signing', e.message);
+        }
+      });
+
+      if (peerConnectedListenerRef.current) peerConnectedListenerRef.current.remove();
+      peerConnectedListenerRef.current = MultipeerBridge.onPeerConnected((event) => {
+        setStatusMessage(`Scanner connected: ${event.peer}`);
+      });
+    } catch (e) {
+      Alert.alert('Error', e.message);
+      setMode(null);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handleScannerMode() {
     if (!backendUrl || !accessToken) return Alert.alert('Backend URL and token required');
-    if (!userId) return Alert.alert('Owner user ID required');
-    setMode('scanner');
-    Alert.alert('Scanner mode', 'Waiting for owner device to connect via Multipeer (TODO)');
-  }
-
-  async function handleSimulateChallenge() {
-    if (!backendUrl || !accessToken) return Alert.alert('Backend URL and token required');
-    if (!userId) return Alert.alert('Owner user ID required');
+    if (!ownerId) return Alert.alert('Owner user ID required');
     setLoading(true);
+    setMode('scanner');
+    setStatusMessage('Browsing for owner device...');
+
     try {
-      const challenge = await generateChallenge();
-      const sig = await signChallenge(challenge);
-      const resp = await postChallengeToServer(backendUrl, accessToken, userId, challenge, sig);
-      setPairingResult({ challenge: challenge.substring(0, 20) + '...', resp });
+      // Start browsing
+      await MultipeerBridge.startBrowsing();
+      setStatusMessage('Searching for owner...');
+
+      // Listen for peer connection
+      if (peerConnectedListenerRef.current) peerConnectedListenerRef.current.remove();
+      peerConnectedListenerRef.current = MultipeerBridge.onPeerConnected(async (event) => {
+        try {
+          setStatusMessage('Owner connected! Generating challenge...');
+          // Generate challenge
+          const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+          const challenge = Base64.fromUint8Array(randomBytes);
+          currentChallengeRef.current = challenge;
+          
+          // Send challenge to owner
+          await MultipeerBridge.sendChallenge(challenge);
+          setStatusMessage('Challenge sent. Waiting for signature...');
+        } catch (e) {
+          Alert.alert('Error', e.message);
+        }
+      });
+
+      // Listen for signature response
+      if (dataReceivedListenerRef.current) dataReceivedListenerRef.current.remove();
+      dataReceivedListenerRef.current = MultipeerBridge.onDataReceived(async (event) => {
+        try {
+          const sig = event.data;
+          setStatusMessage('Signature received. Claiming pairing...');
+          const challenge = currentChallengeRef.current;
+          
+          if (!challenge) throw new Error('No challenge found');
+          
+          const resp = await postChallengeToServer(backendUrl, accessToken, ownerId, challenge, sig);
+          setPairingResult({ challenge: challenge.substring(0, 20) + '...', resp });
+          setStatusMessage('Pairing successful!');
+        } catch (e) {
+          Alert.alert('Error', e.message);
+        }
+      });
     } catch (e) {
       Alert.alert('Error', e.message);
+      setMode(null);
     } finally {
       setLoading(false);
     }
@@ -145,11 +217,14 @@ export default function App() {
 
   function dismissResult() {
     setPairingResult(null);
+    setStatusMessage('');
+    MultipeerBridge.stopSession();
+    setMode(null);
   }
 
   return (
     <SafeAreaView style={{ flex: 1, padding: 16, backgroundColor: '#fff' }}>
-      <Text style={{ fontSize: 18, fontWeight: 'bold' }}>canImakeanApp — iOS Challenge-Response Pairing</Text>
+      <Text style={{ fontSize: 18, fontWeight: 'bold' }}>canImakeanApp — iOS Multipeer Pairing</Text>
       <ScrollView style={{ marginTop: 12 }}>
         <Text style={{ fontWeight: 'bold', marginTop: 16 }}>Setup</Text>
         <Text>Your User ID:</Text>
@@ -161,25 +236,27 @@ export default function App() {
         <Text style={{ fontWeight: 'bold', marginTop: 16 }}>Backend Configuration</Text>
         <Text>Backend URL:</Text>
         <TextInput value={backendUrl} onChangeText={setBackendUrl} style={{ borderWidth: 1, padding: 8, marginTop: 4 }} placeholder="https://api.example.com" />
-        <Text style={{ marginTop: 8 }}>Access Token (your JWT):</Text>
+        <Text style={{ marginTop: 8 }}>Access Token:</Text>
         <TextInput value={accessToken} onChangeText={setAccessToken} style={{ borderWidth: 1, padding: 8, marginTop: 4 }} placeholder="Bearer token" secureTextEntry />
         <View style={{ marginTop: 8 }} />
         <Button title="Register Public Key with Server" onPress={handleRegisterPublicKey} disabled={loading} />
 
         <Text style={{ fontWeight: 'bold', marginTop: 16 }}>Pairing Mode</Text>
         <View style={{ marginVertical: 8 }}>
-          <Button title="Owner Mode (Accept Pairing)" onPress={handleOwnerMode} disabled={loading} />
+          <Button title="Owner Mode (Accept Pairing)" onPress={handleOwnerMode} disabled={loading || mode === 'scanner'} />
         </View>
         <View style={{ marginBottom: 8 }}>
-          <Button title="Scanner Mode (Initiate Pairing)" onPress={handleScannerMode} disabled={loading} />
+          <Text>Owner User ID (for scanner):</Text>
+          <TextInput value={ownerId} onChangeText={setOwnerId} style={{ borderWidth: 1, padding: 8, marginTop: 4 }} placeholder="Owner's UUID" />
         </View>
-        <Text style={{ marginTop: 8, fontSize: 12 }}>Mode: {mode || 'None'}</Text>
+        <View style={{ marginBottom: 8 }}>
+          <Button title="Scanner Mode (Initiate Pairing)" onPress={handleScannerMode} disabled={loading || mode === 'owner'} />
+        </View>
+        <Text style={{ marginTop: 8, fontSize: 12 }}>Mode: {mode ? mode.toUpperCase() : 'None'}</Text>
 
-        <Text style={{ fontWeight: 'bold', marginTop: 16 }}>Test (Local Simulation)</Text>
-        <Text style={{ fontSize: 12 }}>Simulates challenge-response for testing</Text>
-        <View style={{ marginTop: 8 }} />
+        <Text style={{ fontWeight: 'bold', marginTop: 16 }}>Status</Text>
         {loading && <ActivityIndicator size="large" />}
-        <Button title="Simulate Challenge & Pair" onPress={handleSimulateChallenge} disabled={loading} />
+        <Text style={{ marginTop: 8, fontSize: 12, color: '#666' }}>{statusMessage}</Text>
 
         {pairingResult && (
           <View style={{ marginTop: 20, padding: 12, borderWidth: 1, borderColor: '#4caf50', backgroundColor: '#e8f5e9' }}>

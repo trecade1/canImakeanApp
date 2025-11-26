@@ -6,6 +6,7 @@ CREATE TABLE users (
   password_hash TEXT NOT NULL,
   display_name TEXT,
   bio TEXT,
+  public_key TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
 
